@@ -1,198 +1,341 @@
-import logging
-import requests
-import threading
 import os
-from flask import Flask
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from appwrite.client import Client
-from appwrite.services.databases import Databases
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import json
+import time
+import re
+from flask import Flask, request, jsonify, send_file, render_template_string, Response
+import yt_dlp
 
-# ------------------------------------------------------------------
-# ⚙️ CONFIGURATION
-# ------------------------------------------------------------------
-# ⚠️ PASTE YOUR TELEGRAM BOT TOKEN BELOW
-TELEGRAM_BOT_TOKEN = "8551885799:AAG1iqE8ObrqwETtjuYJhdw430TNoPGtqnc"
-
-# Appwrite Config
-APPWRITE_ENDPOINT = "https://fra.cloud.appwrite.io/v1"
-APPWRITE_PROJECT_ID = "697814dc00318b052e40"
-APPWRITE_API_KEY = "standard_d568cc436f162ea258544b826d81f125ee5439fef59bb25bd975d0ccb06e696cf35afe619bb747290151129a1001162a2aa7447ae9d681b03321e072d987b442a8637628d034a90512ad9e9c4354ccaf7d4382a7a094cf8018f517917a76c46c629ddab6958a830e5bbf8d689e09b7dc8bda484ff06f55cdcc57d7ce4c4d6a98"
-APPWRITE_DB_ID = "69781519001bb396e648"
-APPWRITE_COLLECTION_ID = "scrap"
-
-# API Config
-# UPDATED API URL
-API_URL = "https://api.paanel.shop/numapi.php"
-API_KEY = "num_wanted"
-
-# Owner Config
-OWNER_TAG = "@Hamza3895"
-
-# ------------------------------------------------------------------
-# 🌐 DUMMY WEB SERVER (FOR RENDER DEPLOYMENT)
-# ------------------------------------------------------------------
 app = Flask(__name__)
 
-@app.route('/')
-def health_check():
-    return "Bot is Alive!"
+# --- CONFIGURATION ---
+# Use a temporary directory for downloads
+DOWNLOAD_FOLDER = '/tmp' if os.path.exists('/tmp') else 'downloads'
+if not os.path.exists(DOWNLOAD_FOLDER):
+    os.makedirs(DOWNLOAD_FOLDER)
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+# --- FRONTEND TEMPLATE (HTML/CSS/JS) ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NexStream | YT Downloader</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            min-height: 100vh;
+            color: #e2e8f0;
+            font-family: 'Inter', sans-serif;
+        }
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .loader {
+            border-top-color: #3b82f6;
+            -webkit-animation: spinner 1.5s linear infinite;
+            animation: spinner 1.5s linear infinite;
+        }
+        @keyframes spinner {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="flex items-center justify-center p-4">
 
-# ------------------------------------------------------------------
-# 🔌 SETUP
-# ------------------------------------------------------------------
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+    <div class="w-full max-w-3xl glass-panel rounded-2xl shadow-2xl overflow-hidden p-6 md:p-8">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl md:text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-500 mb-2">
+                NexStream
+            </h1>
+            <p class="text-slate-400 text-sm">Download Videos, Audio & Transcripts Instantly</p>
+        </div>
 
-client = Client()
-client.set_endpoint(APPWRITE_ENDPOINT)
-client.set_project(APPWRITE_PROJECT_ID)
-client.set_key(APPWRITE_API_KEY)
-databases = Databases(client)
+        <div class="relative mb-8">
+            <div class="flex items-center bg-slate-800/50 rounded-xl border border-slate-700 focus-within:border-blue-500 focus-within:ring-1 focus-within:ring-blue-500 transition-all">
+                <i class="fa-solid fa-link text-slate-500 ml-4"></i>
+                <input type="text" id="videoUrl" placeholder="Paste YouTube URL here..." 
+                    class="w-full bg-transparent border-none focus:ring-0 text-white placeholder-slate-500 py-4 px-3">
+                <button onclick="analyzeVideo()" 
+                    class="mr-2 bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-medium transition-colors">
+                    Analyze
+                </button>
+            </div>
+            <p id="errorMsg" class="text-red-400 text-sm mt-2 hidden"></p>
+        </div>
 
-session = requests.Session()
-retry_strategy = Retry(
-    total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("https://", adapter)
+        <div id="loading" class="hidden flex justify-center my-12">
+            <div class="loader ease-linear rounded-full border-4 border-t-4 border-slate-700 h-12 w-12"></div>
+        </div>
 
-# ------------------------------------------------------------------
-# 🛠 HELPER FUNCTIONS
-# ------------------------------------------------------------------
+        <div id="results" class="hidden animate-fade-in-up">
+            <div class="flex flex-col md:flex-row gap-6 mb-8">
+                <div class="w-full md:w-1/3">
+                    <img id="thumb" src="" alt="Thumbnail" class="w-full rounded-lg shadow-lg border border-slate-700">
+                    <div class="mt-3 text-center">
+                        <span id="duration" class="bg-slate-800 text-xs px-2 py-1 rounded text-slate-300"></span>
+                    </div>
+                </div>
+                
+                <div class="w-full md:w-2/3">
+                    <h2 id="videoTitle" class="text-xl font-bold text-white mb-2 leading-tight"></h2>
+                    <p id="channelName" class="text-blue-400 text-sm mb-4 font-medium"></p>
+                    
+                    <div class="space-y-4">
+                        
+                        <div class="bg-slate-800/40 rounded-lg p-4 border border-slate-700/50">
+                            <h3 class="text-sm font-semibold text-slate-300 mb-3 flex items-center">
+                                <i class="fa-solid fa-video-slash mr-2 text-purple-400"></i> Video (No Sound)
+                            </h3>
+                            <div id="videoContainer" class="grid grid-cols-2 sm:grid-cols-3 gap-2"></div>
+                        </div>
 
-def fetch_data(mobile_number):
-    try:
-        # Params construct the full URL: ...php?action=api&key=num_wanted&number=...
-        params = {"action": "api", "key": API_KEY, "number": mobile_number}
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36"}
-        response = session.get(API_URL, params=params, headers=headers, timeout=20)
-        try:
-            data = response.json()
-        except:
-            return []
-        
-        # New API returns a list directly, this handles it perfectly
-        if isinstance(data, list): return data
-        elif isinstance(data, dict):
-            if data.get('error') or data.get('response') == 'error': return []
-            return [data]
-        return []
-    except Exception as e:
-        logging.error(f"API Fetch Error: {e}")
-        return []
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div class="bg-slate-800/40 rounded-lg p-4 border border-slate-700/50">
+                                <h3 class="text-sm font-semibold text-slate-300 mb-3 flex items-center">
+                                    <i class="fa-solid fa-music mr-2 text-green-400"></i> Audio (MP3)
+                                </h3>
+                                <button onclick="downloadMedia('audio')" class="w-full bg-slate-700 hover:bg-green-600 hover:text-white text-slate-300 py-2 rounded text-sm transition-colors">
+                                    Download Highest Quality
+                                </button>
+                            </div>
 
-def save_to_appwrite(data_dict, doc_id):
-    try:
-        databases.create_document(APPWRITE_DB_ID, APPWRITE_COLLECTION_ID, doc_id, data_dict)
-        return "success"
-    except Exception as e:
-        if "409" in str(e): return "duplicate"
-        logging.error(f"Appwrite DB Error: {e}")
-        return "error"
+                            <div class="bg-slate-800/40 rounded-lg p-4 border border-slate-700/50">
+                                <h3 class="text-sm font-semibold text-slate-300 mb-3 flex items-center">
+                                    <i class="fa-solid fa-file-lines mr-2 text-yellow-400"></i> Transcript
+                                </h3>
+                                <button onclick="downloadMedia('transcript')" class="w-full bg-slate-700 hover:bg-yellow-600 hover:text-white text-slate-300 py-2 rounded text-sm transition-colors">
+                                    Download Text
+                                </button>
+                            </div>
+                        </div>
 
-# ------------------------------------------------------------------
-# 🤖 BOT HANDLERS
-# ------------------------------------------------------------------
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        f"👋 **Welcome to Nightmare for Strangers Bot!**\n\n"
-        f"🔎 **How to Use:**\n"
-        f"Send `/num` followed by the mobile number.\n"
-        f"Example: `/num 9876543210`\n\n"
-        f"👨‍💻 **Developer:** {OWNER_TAG}\n"
-        f"🆘 **Help/Contact:** {OWNER_TAG}"
-    )
-    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    <script>
+        let currentUrl = '';
 
-async def search_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(f"⚠️ **Usage Error**\nPlease send: `/num 9876543210`", parse_mode=ParseMode.MARKDOWN)
-        return
+        async function analyzeVideo() {
+            const url = document.getElementById('videoUrl').value;
+            const errorMsg = document.getElementById('errorMsg');
+            const loading = document.getElementById('loading');
+            const results = document.getElementById('results');
 
-    searched_number = context.args[0]
-    status_msg = await update.message.reply_text(f"🔍 **Searching:** `{searched_number}` ...", parse_mode=ParseMode.MARKDOWN)
-    
-    results = fetch_data(searched_number)
-    
-    if not results:
-        await status_msg.edit_text("❌ **No data found.**")
-        return
+            if (!url) return;
 
-    response_text = f"📂 **Results for {searched_number}:**\n\n"
-    has_valid_data = False
+            // Reset UI
+            currentUrl = url;
+            errorMsg.classList.add('hidden');
+            results.classList.add('hidden');
+            loading.classList.remove('hidden');
 
-    for p in results:
-        raw_name = p.get("name")
-        # Strict N/A Check
-        if not raw_name or str(raw_name).strip() in ["", "N/A", "null", "None"]: 
-            continue
-        
-        has_valid_data = True
-        result_mobile = str(p.get("mobile", searched_number))
-        
-        # New API uses "!" in address, this replace logic handles it correctly
-        clean_address = str(p.get("address", "N/A")).replace("!", ", ").replace(" ,", ",").strip()[:250]
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url: url})
+                });
+                
+                const data = await response.json();
 
-        record = {
-            'name': str(raw_name),
-            'fname': str(p.get("father_name", "N/A")),
-            'mobile': result_mobile,
-            'address': clean_address
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                // Populate Data
+                document.getElementById('thumb').src = data.thumbnail;
+                document.getElementById('videoTitle').innerText = data.title;
+                document.getElementById('channelName').innerText = data.uploader;
+                document.getElementById('duration').innerText = data.duration_string;
+
+                // Populate Video (No Sound) Options
+                const videoContainer = document.getElementById('videoContainer');
+                videoContainer.innerHTML = '';
+                
+                data.formats.forEach(fmt => {
+                    const btn = document.createElement('button');
+                    btn.className = 'bg-slate-700 hover:bg-purple-600 text-xs py-2 px-3 rounded text-slate-200 transition-colors truncate';
+                    btn.innerText = `${fmt.resolution} (${fmt.ext})`;
+                    btn.onclick = () => downloadMedia('video_nosound', fmt.format_id);
+                    videoContainer.appendChild(btn);
+                });
+
+                loading.classList.add('hidden');
+                results.classList.remove('hidden');
+
+            } catch (err) {
+                loading.classList.add('hidden');
+                errorMsg.innerText = "Error: " + err.message;
+                errorMsg.classList.remove('hidden');
+            }
         }
 
-        # Database Save
-        status = save_to_appwrite(record, result_mobile)
-        
-        # Status Icon Logic
-        if status == "success": db_status = "✅ Saved"
-        elif status == "duplicate": db_status = "🔁 Exists"
-        else: db_status = "⚠️ Error"
+        function downloadMedia(type, formatId = null) {
+            let path = `/download?url=${encodeURIComponent(currentUrl)}&type=${type}`;
+            if (formatId) {
+                path += `&format_id=${formatId}`;
+            }
+            window.location.href = path;
+        }
+    </script>
+</body>
+</html>
+"""
 
-        # Build Card
-        response_text += (
-            f"📱 **Mobile:** `{record['mobile']}`\n"
-            f"👤 **Name:** `{record['name']}`\n"
-            f"👴 **Father:** {record['fname']}\n"
-            f"🏠 **Address:** {record['address']}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-        )
+# --- BACKEND LOGIC ---
 
-    # Footer
-    response_text += f"\n🤖 **Bot by {OWNER_TAG}**"
+def clean_filename(title):
+    return re.sub(r'[\\/*?:"<>|]', "", title)
 
-    if has_valid_data:
-        if len(response_text) > 4000: response_text = response_text[:4000] + "\n...(truncated)"
-        await status_msg.edit_text(response_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await status_msg.edit_text("❌ **No data found.**")
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE)
 
-# ------------------------------------------------------------------
-# ▶️ MAIN EXECUTION
-# ------------------------------------------------------------------
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    url = request.json.get('url')
+    if not url:
+        return jsonify({'error': 'No URL provided'}), 400
+
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            # Filter formats: Video only (no audio)
+            # We look for formats where vcodec is NOT none and acodec IS none
+            formats = []
+            for f in info['formats']:
+                if f.get('vcodec') != 'none' and f.get('acodec') == 'none':
+                    # Simplify resolution label
+                    res = f.get('height')
+                    if res:
+                        formats.append({
+                            'format_id': f['format_id'],
+                            'resolution': f'{res}p',
+                            'ext': f['ext'],
+                            'filesize': f.get('filesize', 0)
+                        })
+            
+            # Sort by resolution (high to low) and take unique resolutions to avoid clutter
+            formats.sort(key=lambda x: int(x['resolution'].replace('p','')), reverse=True)
+            # Deduplicate by resolution for cleaner UI
+            seen_res = set()
+            unique_formats = []
+            for f in formats:
+                if f['resolution'] not in seen_res:
+                    unique_formats.append(f)
+                    seen_res.add(f['resolution'])
+
+            return jsonify({
+                'title': info.get('title'),
+                'uploader': info.get('uploader'),
+                'thumbnail': info.get('thumbnail'),
+                'duration_string': info.get('duration_string'),
+                'formats': unique_formats[:6] # Limit to top 6 options
+            })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/download', methods=['GET'])
+def download():
+    url = request.args.get('url')
+    dtype = request.args.get('type')
+    fmt_id = request.args.get('format_id')
+    
+    if not url or not dtype:
+        return "Missing parameters", 400
+
+    try:
+        # Common options
+        ydl_opts = {
+            'outtmpl': f'{DOWNLOAD_FOLDER}/%(title)s.%(ext)s',
+            'quiet': True,
+        }
+
+        # 1. Download Video (No Sound)
+        if dtype == 'video_nosound':
+            ydl_opts['format'] = fmt_id
+
+        # 2. Download Audio (MP3)
+        elif dtype == 'audio':
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            })
+
+        # 3. Download Transcript
+        elif dtype == 'transcript':
+            # Special handling for transcripts: we extract, don't download media
+            ydl_opts.update({
+                'skip_download': True,
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': ['en'],
+                'outtmpl': f'{DOWNLOAD_FOLDER}/%(title)s', # Base name
+            })
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True) # download=True here means download SUBS
+                title = clean_filename(info['title'])
+                
+                # Check for the generated file (usually .en.vtt)
+                # We try to find the file that was just created
+                potential_files = [f for f in os.listdir(DOWNLOAD_FOLDER) if title in f and f.endswith('.vtt')]
+                
+                if potential_files:
+                    file_path = os.path.join(DOWNLOAD_FOLDER, potential_files[0])
+                    # Clean the VTT to plain text for user friendliness
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        # Simple regex to strip VTT timestamps/headers
+                        text_content = re.sub(r'WEBVTT.*', '', content, flags=re.DOTALL)
+                        text_content = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3}.*\n', '', text_content) # Remove timestamps
+                        text_content = re.sub(r'<[^>]+>', '', text_content) # Remove tags
+                        text_content = os.linesep.join([s for s in text_content.splitlines() if s.strip()]) # Remove empty lines
+                    
+                    # Send as plain text
+                    return Response(
+                        text_content,
+                        mimetype="text/plain",
+                        headers={"Content-disposition": f"attachment; filename={title}_transcript.txt"}
+                    )
+                else:
+                    return "No English transcript found.", 404
+
+        # EXECUTE DOWNLOAD (For Audio/Video)
+        if dtype != 'transcript':
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                
+                # If audio conversion happened, the extension changes
+                if dtype == 'audio':
+                    filename = os.path.splitext(filename)[0] + '.mp3'
+
+                return send_file(filename, as_attachment=True)
+
+    except Exception as e:
+        return f"Error: {str(e)}", 500
 
 if __name__ == '__main__':
-    if "YOUR_TELEGRAM_BOT_TOKEN" in TELEGRAM_BOT_TOKEN:
-        print("❌ ERROR: Please paste your Telegram Bot Token in line 18!")
-        exit()
-
-    # 1. Start Web Server (For Render)
-    print("🌍 Starting Web Server...")
-    threading.Thread(target=run_web_server).start()
-
-    # 2. Start Bot
-    print("🔥 Bot Started...")
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("num", search_num))
-    application.run_polling()
+    app.run(host='0.0.0.0', port=5000)
